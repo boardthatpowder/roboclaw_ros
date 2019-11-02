@@ -11,113 +11,10 @@ from nav_msgs.msg import Odometry
 
 __author__ = "bwbazemore@uga.edu (Brad Bazemore)"
 
-
-# TODO need to find some better was of handling OSerror 11 or preventing it, any ideas?
-
-class EncoderOdom:
-    def __init__(self, ticks_per_meter, base_width):
-        self.TICKS_PER_METER = ticks_per_meter
-        self.BASE_WIDTH = base_width
-        self.odom_pub = rospy.Publisher('/odom', Odometry, queue_size=10)
-        self.cur_x = 0
-        self.cur_y = 0
-        self.cur_theta = 0.0
-        self.last_enc_left = 0
-        self.last_enc_right = 0
-        self.last_enc_time = rospy.Time.now()
-
-    @staticmethod
-    def normalize_angle(angle):
-        while angle > pi:
-            angle -= 2.0 * pi
-        while angle < -pi:
-            angle += 2.0 * pi
-        return angle
-
-    def update(self, enc_left, enc_right):
-        left_ticks = enc_left - self.last_enc_left
-        right_ticks = enc_right - self.last_enc_right
-        self.last_enc_left = enc_left
-        self.last_enc_right = enc_right
-
-        dist_left = left_ticks / self.TICKS_PER_METER
-        dist_right = right_ticks / self.TICKS_PER_METER
-        dist = (dist_right + dist_left) / 2.0
-
-        current_time = rospy.Time.now()
-        d_time = (current_time - self.last_enc_time).to_sec()
-        self.last_enc_time = current_time
-
-        # TODO find better what to determine going straight, this means slight deviation is accounted
-        if left_ticks == right_ticks:
-            d_theta = 0.0
-            self.cur_x += dist * cos(self.cur_theta)
-            self.cur_y += dist * sin(self.cur_theta)
-        else:
-            d_theta = (dist_right - dist_left) / self.BASE_WIDTH
-            r = dist / d_theta
-            self.cur_x += r * (sin(d_theta + self.cur_theta) - sin(self.cur_theta))
-            self.cur_y -= r * (cos(d_theta + self.cur_theta) - cos(self.cur_theta))
-            self.cur_theta = self.normalize_angle(self.cur_theta + d_theta)
-
-        if abs(d_time) < 0.000001:
-            vel_x = 0.0
-            vel_theta = 0.0
-        else:
-            vel_x = dist / d_time
-            vel_theta = d_theta / d_time
-
-        return vel_x, vel_theta
-
-    def update_publish(self, enc_left, enc_right):
-        # 2106 per 0.1 seconds is max speed, error in the 16th bit is 32768
-        # TODO lets find a better way to deal with this error
-        if abs(enc_left - self.last_enc_left) > 20000:
-            rospy.logerr("Ignoring left encoder jump: cur %d, last %d" % (enc_left, self.last_enc_left))
-        elif abs(enc_right - self.last_enc_right) > 20000:
-            rospy.logerr("Ignoring right encoder jump: cur %d, last %d" % (enc_right, self.last_enc_right))
-        else:
-            vel_x, vel_theta = self.update(enc_left, enc_right)
-            self.publish_odom(self.cur_x, self.cur_y, self.cur_theta, vel_x, vel_theta)
-
-    def publish_odom(self, cur_x, cur_y, cur_theta, vx, vth):
-        quat = tf.transformations.quaternion_from_euler(0, 0, cur_theta)
-        current_time = rospy.Time.now()
-
-        br = tf.TransformBroadcaster()
-        br.sendTransform((cur_x, cur_y, 0),
-                         tf.transformations.quaternion_from_euler(0, 0, -cur_theta),
-                         current_time,
-                         "base_link",
-                         "odom")
-
-        odom = Odometry()
-        odom.header.stamp = current_time
-        odom.header.frame_id = 'odom'
-
-        odom.pose.pose.position.x = cur_x
-        odom.pose.pose.position.y = cur_y
-        odom.pose.pose.position.z = 0.0
-        odom.pose.pose.orientation = Quaternion(*quat)
-
-        odom.pose.covariance[0] = 0.01
-        odom.pose.covariance[7] = 0.01
-        odom.pose.covariance[14] = 99999
-        odom.pose.covariance[21] = 99999
-        odom.pose.covariance[28] = 99999
-        odom.pose.covariance[35] = 0.01
-
-        odom.child_frame_id = 'base_link'
-        odom.twist.twist.linear.x = vx
-        odom.twist.twist.linear.y = 0
-        odom.twist.twist.angular.z = vth
-        odom.twist.covariance = odom.pose.covariance
-
-        self.odom_pub.publish(odom)
-
-
 class Node:
     def __init__(self):
+
+        self.MAX_COMMAND_VALUE = 127
 
         self.ERRORS = {0x0000: (diagnostic_msgs.msg.DiagnosticStatus.OK, "Normal"),
                        0x0001: (diagnostic_msgs.msg.DiagnosticStatus.WARN, "M1 over current"),
@@ -173,14 +70,12 @@ class Node:
         else:
             rospy.logdebug(repr(version[1]))
 
-        roboclaw.SpeedM1M2(self.address, 0, 0)
-        roboclaw.ResetEncoders(self.address)
+        roboclaw.ForwardM1(self.address, 0)
+        roboclaw.ForwardM2(self.address, 0)
 
         self.MAX_SPEED = float(rospy.get_param("~max_speed", "2.0"))
-        self.TICKS_PER_METER = float(rospy.get_param("~tick_per_meter", "4342.2"))
         self.BASE_WIDTH = float(rospy.get_param("~base_width", "0.315"))
 
-        self.encodm = EncoderOdom(self.TICKS_PER_METER, self.BASE_WIDTH)
         self.last_set_speed_time = rospy.get_rostime()
 
         rospy.Subscriber("cmd_vel", Twist, self.cmd_vel_callback)
@@ -191,7 +86,6 @@ class Node:
         rospy.logdebug("baud %d", baud_rate)
         rospy.logdebug("address %d", self.address)
         rospy.logdebug("max_speed %f", self.MAX_SPEED)
-        rospy.logdebug("ticks_per_meter %f", self.TICKS_PER_METER)
         rospy.logdebug("base_width %f", self.BASE_WIDTH)
 
     def run(self):
@@ -208,31 +102,6 @@ class Node:
                     rospy.logerr("Could not stop")
                     rospy.logdebug(e)
 
-            # TODO need find solution to the OSError11 looks like sync problem with serial
-            status1, enc1, crc1 = None, None, None
-            status2, enc2, crc2 = None, None, None
-
-            try:
-                status1, enc1, crc1 = roboclaw.ReadEncM1(self.address)
-            except ValueError:
-                pass
-            except OSError as e:
-                rospy.logwarn("ReadEncM1 OSError: %d", e.errno)
-                rospy.logdebug(e)
-
-            try:
-                status2, enc2, crc2 = roboclaw.ReadEncM2(self.address)
-            except ValueError:
-                pass
-            except OSError as e:
-                rospy.logwarn("ReadEncM2 OSError: %d", e.errno)
-                rospy.logdebug(e)
-
-            if ('enc1' in vars()) and ('enc2' in vars()):
-                rospy.logdebug(" Encoders %d %d" % (enc1, enc2))
-                self.encodm.update_publish(enc1, enc2)
-
-                self.updater.update()
             r_time.sleep()
 
     def cmd_vel_callback(self, twist):
@@ -244,23 +113,45 @@ class Node:
         if linear_x < -self.MAX_SPEED:
             linear_x = -self.MAX_SPEED
 
-        vr = linear_x + twist.angular.z * self.BASE_WIDTH / 2.0  # m/s
-        vl = linear_x - twist.angular.z * self.BASE_WIDTH / 2.0
+        rospy.logdebug("linear_x before:%f, after:%f", twist.linear.x, linear_x)
 
-        vr_ticks = int(vr * self.TICKS_PER_METER)  # ticks/s
-        vl_ticks = int(vl * self.TICKS_PER_METER)
+        # velocity in m/s
+        v_l = linear_x - twist.angular.z * self.BASE_WIDTH / 2.0
+        v_r = linear_x + twist.angular.z * self.BASE_WIDTH / 2.0
 
-        rospy.logdebug("vr_ticks:%d vl_ticks: %d", vr_ticks, vl_ticks)
+        rospy.logdebug("angular.z:%f, base_width:%f, v_l:%f, v_r:%f", twist.angular.z, self.BASE_WIDTH, v_l, v_r)
+
+        # roboclaw duty values
+        rc_val_l = int(self.MAX_COMMAND_VALUE / self.MAX_SPEED * v_l)
+        rc_val_r = int(self.MAX_COMMAND_VALUE / self.MAX_SPEED * v_r)
+
+        rospy.logdebug("rc_val_l before:%f, rc_val_r before:%f", rc_val_l, rc_val_r)
+
+        if rc_val_l > self.MAX_COMMAND_VALUE:
+            rc_val_l = self.MAX_COMMAND_VALUE
+        if rc_val_l < -self.MAX_COMMAND_VALUE:
+            rc_val_l = -self.MAX_COMMAND_VALUE
+
+        if rc_val_r > self.MAX_COMMAND_VALUE:
+            rc_val_r = self.MAX_COMMAND_VALUE
+        if rc_val_r < -self.MAX_COMMAND_VALUE:
+            rc_val_r = -self.MAX_COMMAND_VALUE
+
+        rospy.logdebug("rc_val_l after:%f, rc_val_r after:%f", rc_val_l, rc_val_r)
 
         try:
-            # This is a hack way to keep a poorly tuned PID from making noise at speed 0
-            if vr_ticks is 0 and vl_ticks is 0:
-                roboclaw.ForwardM1(self.address, 0)
-                roboclaw.ForwardM2(self.address, 0)
+            if rc_val_r>=0:
+                roboclaw.ForwardM1(self.address, rc_val_r)
             else:
-                roboclaw.SpeedM1M2(self.address, vr_ticks, vl_ticks)
+                roboclaw.BackwardM1(self.address, rc_val_r*-1)
+            
+            if rc_val_l>=0:
+                roboclaw.ForwardM2(self.address, rc_val_l)
+            else:
+                roboclaw.BackwardM2(self.address, rc_val_l*-1)
+
         except OSError as e:
-            rospy.logwarn("SpeedM1M2 OSError: %d", e.errno)
+            rospy.logwarn("ForwardM1/M2 OSError: %d", e.errno)
             rospy.logdebug(e)
 
     # TODO: Need to make this work when more than one error is raised
